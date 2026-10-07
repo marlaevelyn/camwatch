@@ -59,7 +59,9 @@ swiftc -O camwatch.swift -o camwatch -framework CoreMediaIO -framework CoreAudio
 
 On each change, `watch` runs `on-change.sh <video|mic|off> "<details>"` from the same directory as the binary. That script picks the color (edit it to change colors) and runs `./set-bulb color R G B`, which sets the bulbs listed in `bulb.conf`.
 
-**Missed updates are retried.** Each bulb must confirm the change; unconfirmed bulbs are retried for about a minute, then logged as not responding. If a bulb stops answering, `set-bulb` searches the network for its MAC and updates `bulb.conf` when the bulb has a new IP. Every 5 minutes camwatch also re-sends the current color, which fixes a bulb that was switched off at the wall or missed an update. As a result, a color you set on that bulb in the WiZ app is reverted within 5 minutes, so use a dedicated bulb.
+**Missed updates are retried.** Each bulb must confirm the change; unconfirmed bulbs are retried for about a minute, then logged as not responding. If a bulb stops answering, `set-bulb` searches the network for its MAC and updates `bulb.conf` when the bulb has a new IP. Every 5 minutes camwatch also re-checks the bulbs and corrects any that missed an update.
+
+**Changing the bulb by hand.** camwatch sets its colors at 99% brightness, an invisible difference that marks the setting as its own. The 5-minute re-check only corrects bulbs showing a camwatch color (99%, no scene) that's wrong for the current state. If you change the bulb in the WiZ app or switch it off, your setting stays until the next camera or mic change, when camwatch takes over again. The one exception is picking exactly red, green or purple at exactly 99% by hand: camwatch can't tell that from its own setting.
 
 ## Choose the bulb
 

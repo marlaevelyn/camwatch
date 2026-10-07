@@ -5,7 +5,8 @@
   ./set-bulb <ip|mac> ...       control these bulbs from now on
   ./set-bulb color R G B        set the controlled bulbs to this color (used by on-change.sh)
   ./set-bulb color R G B --refresh
-                                same, but one quiet attempt (camwatch's 5-minute re-check)
+                                camwatch's 5-minute re-check: fix only bulbs that
+                                missed an update, leaving hand-set bulbs alone
 
 The choice is saved to bulb.conf (one "ip mac" per line), which is read on
 every change, so it takes effect without restarting camwatch.
@@ -75,33 +76,18 @@ def relocate(lost):
     return moved
 
 
-def confirmed(data):
-    try:
-        reply = json.loads(data)
-    except ValueError:
-        return False
-    return reply.get("method") == "setPilot" and reply.get("result", {}).get("success") is True
-
-
-def apply_color(r, g, b, refresh=False):
-    """Set every configured bulb to this color, retrying until each one confirms."""
-    pending = dict(configured())  # ip -> mac
-    if not pending:
-        if not refresh:
-            print("[set-bulb] no bulb configured; run ./set-bulb", flush=True)
-        return
-    pilot = json.dumps({"method": "setPilot",
-                        "params": {"state": True, "r": r, "g": g, "b": b, "dimming": 100}}).encode()
+def exchange(message, bulbs, accept, delays, relocate_after=None):
+    """Send `message` to each bulb ({ip: mac}) until it sends a reply that
+    `accept`s, waiting `delays[i]` seconds before attempt i. After attempt
+    `relocate_after`, look for silent bulbs by MAC in case their IP changed.
+    Returns ({ip: reply}, {ip: mac} of bulbs that never answered)."""
+    pending = dict(bulbs)
+    replies = {}
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    # Seconds to wait before each attempt: about a minute in total for a real
-    # change. The 5-minute refresh tries once, plus once more if a bulb moved.
-    delays = [0, 0] if refresh else [0, 1, 2, 4, 8, 15, 30]
-    relocate_after = 0 if refresh else 1
     for attempt, delay in enumerate(delays):
         time.sleep(delay)
         for ip in pending:
-            sock.sendto(pilot, (ip, PORT))
+            sock.sendto(message, (ip, PORT))
         deadline = time.time() + 1
         while pending and time.time() < deadline:
             sock.settimeout(max(0.05, deadline - time.time()))
@@ -109,18 +95,66 @@ def apply_color(r, g, b, refresh=False):
                 data, (ip, _) = sock.recvfrom(4096)
             except socket.timeout:
                 break
-            if ip in pending and confirmed(data):
+            try:
+                reply = json.loads(data)
+            except ValueError:
+                continue
+            if ip in pending and accept(reply):
+                replies[ip] = reply
                 del pending[ip]
         if not pending:
-            return
+            break
         if attempt == relocate_after:
             for old, new in relocate(pending).items():
                 pending[new] = pending.pop(old)
+    return replies, pending
 
-    if not refresh:
-        for ip, mac in pending.items():
-            print(f"[set-bulb] bulb {ip} ({mac}) not responding; "
-                  "camwatch will retry at its next 5-minute check", flush=True)
+
+# camwatch sets its colors at this brightness instead of 100%. The 1% difference
+# isn't visible, but it marks the bulb's setting as camwatch's: a bulb showing
+# any other brightness, a scene, or switched off was changed by hand.
+SIGNATURE_DIMMING = 99
+
+
+def set_by_camwatch(pilot):
+    return (pilot.get("state") is True and pilot.get("dimming") == SIGNATURE_DIMMING
+            and not pilot.get("sceneId") and "r" in pilot)
+
+
+def apply_color(r, g, b, refresh=False):
+    """Set every configured bulb to this color, retrying until each one confirms.
+
+    With refresh (camwatch's 5-minute re-check), only correct bulbs that still
+    show a camwatch color that is now wrong, i.e. ones that missed an update.
+    A bulb someone changed by hand is left alone until the next real change."""
+    bulbs = dict(configured())  # ip -> mac
+    if not bulbs:
+        if not refresh:
+            print("[set-bulb] no bulb configured; run ./set-bulb", flush=True)
+        return
+
+    if refresh:
+        replies, _ = exchange(b'{"method":"getPilot","params":{}}', bulbs,
+                              lambda reply: reply.get("method") == "getPilot" and "result" in reply,
+                              delays=[0, 0], relocate_after=0)
+        bulbs = {ip: mac for ip, mac in configured()
+                 if ip in replies and set_by_camwatch(current := replies[ip]["result"])
+                 and (current.get("r"), current.get("g"), current.get("b")) != (r, g, b)}
+        if not bulbs:
+            return
+
+    pilot = json.dumps({"method": "setPilot", "params": {
+        "state": True, "r": r, "g": g, "b": b, "dimming": SIGNATURE_DIMMING}}).encode()
+    confirmed = lambda reply: reply.get("method") == "setPilot" and reply.get("result", {}).get("success") is True
+    if refresh:
+        exchange(pilot, bulbs, confirmed, delays=[0, 0])
+        return
+
+    # About a minute of retries in total for a real change.
+    _, missed = exchange(pilot, bulbs, confirmed, delays=[0, 1, 2, 4, 8, 15, 30], relocate_after=1)
+    for ip, mac in missed.items():
+        print(f"[set-bulb] bulb {ip} ({mac}) not responding; "
+              "camwatch will retry at its next 5-minute check", flush=True)
 
 
 def describe(pilot):
