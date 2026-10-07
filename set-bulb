@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Choose which WiZ bulb(s) camwatch controls.
+"""Choose which WiZ bulb(s) camwatch controls, and set their color.
 
-  ./set-bulb                list WiZ bulbs on the network (* = controlled now)
-  ./set-bulb <ip|mac> ...   control these bulbs from now on
+  ./set-bulb                    list WiZ bulbs on the network (* = controlled now)
+  ./set-bulb <ip|mac> ...       control these bulbs from now on
+  ./set-bulb color R G B        set the controlled bulbs to this color (used by on-change.sh)
+  ./set-bulb color R G B --refresh
+                                same, but one quiet attempt (camwatch's 5-minute re-check)
 
-The choice is saved to bulb.conf (one "ip mac" per line), which on-change.sh
-reads on every change, so it takes effect without restarting camwatch.
+The choice is saved to bulb.conf (one "ip mac" per line), which is read on
+every change, so it takes effect without restarting camwatch.
+
+`color` waits for each bulb to confirm and retries for about a minute. If a
+bulb stops answering, it searches the network for the bulb's MAC and updates
+bulb.conf when the bulb has a new IP.
 """
 import json
 import socket
@@ -51,6 +58,71 @@ def configured():
     return [tuple((line.split() + [""])[:2]) for line in CONF.read_text().splitlines() if line.strip()]
 
 
+def save(bulbs):
+    CONF.write_text("".join(f"{ip} {mac}\n" for ip, mac in bulbs))
+
+
+def relocate(lost):
+    """Find bulbs that stopped answering by MAC. Returns {old_ip: new_ip}."""
+    if not any(lost.values()):
+        return {}
+    by_mac = {normalize_mac(pilot.get("mac", "")): ip for ip, pilot in discover().items()}
+    moved = {ip: by_mac[mac] for ip, mac in lost.items() if mac and by_mac.get(mac, ip) != ip}
+    if moved:
+        save([(moved.get(ip, ip), mac) for ip, mac in configured()])
+        for old, new in moved.items():
+            print(f"[set-bulb] bulb {lost[old]} moved from {old} to {new}; updated bulb.conf", flush=True)
+    return moved
+
+
+def confirmed(data):
+    try:
+        reply = json.loads(data)
+    except ValueError:
+        return False
+    return reply.get("method") == "setPilot" and reply.get("result", {}).get("success") is True
+
+
+def apply_color(r, g, b, refresh=False):
+    """Set every configured bulb to this color, retrying until each one confirms."""
+    pending = dict(configured())  # ip -> mac
+    if not pending:
+        if not refresh:
+            print("[set-bulb] no bulb configured; run ./set-bulb", flush=True)
+        return
+    pilot = json.dumps({"method": "setPilot",
+                        "params": {"state": True, "r": r, "g": g, "b": b, "dimming": 100}}).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Seconds to wait before each attempt: about a minute in total for a real
+    # change. The 5-minute refresh tries once, plus once more if a bulb moved.
+    delays = [0, 0] if refresh else [0, 1, 2, 4, 8, 15, 30]
+    relocate_after = 0 if refresh else 1
+    for attempt, delay in enumerate(delays):
+        time.sleep(delay)
+        for ip in pending:
+            sock.sendto(pilot, (ip, PORT))
+        deadline = time.time() + 1
+        while pending and time.time() < deadline:
+            sock.settimeout(max(0.05, deadline - time.time()))
+            try:
+                data, (ip, _) = sock.recvfrom(4096)
+            except socket.timeout:
+                break
+            if ip in pending and confirmed(data):
+                del pending[ip]
+        if not pending:
+            return
+        if attempt == relocate_after:
+            for old, new in relocate(pending).items():
+                pending[new] = pending.pop(old)
+
+    if not refresh:
+        for ip, mac in pending.items():
+            print(f"[set-bulb] bulb {ip} ({mac}) not responding; "
+                  "camwatch will retry at its next 5-minute check", flush=True)
+
+
 def describe(pilot):
     if not pilot.get("state"):
         return "off"
@@ -64,7 +136,8 @@ def list_bulbs():
     print("Looking for WiZ bulbs...")
     found = discover()
     if not found:
-        sys.exit("No WiZ bulbs answered. Is this Mac on the same network as the bulbs?")
+        sys.exit("No WiZ bulbs answered. Is this Mac on the same Wi-Fi as the bulbs? "
+                 "A VPN can also block access to devices on your home network.")
     for ip in sorted(found, key=lambda ip: tuple(int(part) for part in ip.split("."))):
         mark = "*" if ip in current_ips else " "
         print(f"{mark} {ip:<15} {found[ip].get('mac', '?'):<13} {describe(found[ip])}")
@@ -85,7 +158,7 @@ def set_bulbs(targets):
             sys.exit(f"No WiZ bulb answered at {target}. Run ./set-bulb with no arguments to list bulbs.")
         chosen.append((ip, found[ip].get("mac", "")))
 
-    CONF.write_text("".join(f"{ip} {mac}\n" for ip, mac in chosen))
+    save(chosen)
     for ip, mac in chosen:
         print(f"camwatch now controls {ip} ({mac})", flush=True)
 
@@ -99,6 +172,11 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] in ("-h", "--help"):
         print(__doc__.strip())
+    elif args and args[0] == "color":
+        rgb = [arg for arg in args[1:] if arg != "--refresh"]
+        if len(rgb) != 3 or not all(value.isdigit() and int(value) <= 255 for value in rgb):
+            sys.exit("usage: ./set-bulb color R G B [--refresh]   (each 0-255)")
+        apply_color(*map(int, rgb), refresh="--refresh" in args)
     elif args:
         set_bulbs(args)
     else:

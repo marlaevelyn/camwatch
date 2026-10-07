@@ -116,6 +116,23 @@ func appName(of process: AudioObjectID) -> String {
     return "pid \(pid)"
 }
 
+/// Audio devices that have input streams (microphones).
+func micDevices() -> [AudioObjectID] {
+    var addr = audioAddress(kAudioHardwarePropertyDevices)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(audioSystem, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+    var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(audioSystem, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids.filter { device in
+        var streams = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        var streamsSize: UInt32 = 0
+        return AudioObjectGetPropertyDataSize(device, &streams, 0, nil, &streamsSize) == noErr && streamsSize > 0
+    }
+}
+
 /// Apps currently recording from any microphone.
 func activeMicApps() -> [String] {
     Array(Set(audioProcesses().filter(isRecording).map(appName(of:)))).sorted()
@@ -160,23 +177,67 @@ func report(_ snapshot: Snapshot) {
     print("\(timestamp())  \(snapshot.state.label)\(details)")
 }
 
-func runHook(_ snapshot: Snapshot) {
-    let dir = Bundle.main.executableURL?.resolvingSymlinksInPath().deletingLastPathComponent()
-        ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    let hook = dir.appendingPathComponent("on-change.sh")
+let projectDir = Bundle.main.executableURL?.resolvingSymlinksInPath().deletingLastPathComponent()
+    ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+
+var hookProcess: Process?
+
+/// Run on-change.sh for a state change, or with `refresh` to re-send an
+/// unchanged state (catches bulbs that missed an update or were power-cycled).
+func runHook(_ snapshot: Snapshot, refresh: Bool = false) {
+    let hook = projectDir.appendingPathComponent("on-change.sh")
     guard FileManager.default.isExecutableFile(atPath: hook.path) else { return }
+    if let previous = hookProcess, previous.isRunning {
+        // A refresh never interrupts a hook that is still retrying.
+        if refresh { return }
+        // Stop a still-running hook for an older state so its sends can't land
+        // after the new state's and leave the bulb showing the old color.
+        previous.terminate()
+    }
     let process = Process()
     process.executableURL = hook
-    process.arguments = [snapshot.state.rawValue, snapshot.details]
-    do { try process.run() } catch { print("hook failed: \(error)") }
+    process.arguments = [snapshot.state.rawValue, snapshot.details] + (refresh ? ["refresh"] : [])
+    do { try process.run(); hookProcess = process } catch { print("hook failed: \(error)") }
+}
+
+// MARK: - log pruning
+
+let logURL = projectDir.appendingPathComponent("camwatch.log")
+let logMaxAge: TimeInterval = 24 * 60 * 60
+let logMaxLines = 2000
+
+/// Drop log entries older than 24 hours (an entry is a timestamped line plus the
+/// untimestamped hook lines after it) and cap the log at its last 2000 lines.
+/// Truncates in place rather than replacing the file, because launchd keeps it
+/// open for appending.
+func pruneLog() {
+    guard let text = try? String(contentsOf: logURL, encoding: .utf8) else { return }
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: false).dropLast()  // trailing newline
+    let parser = ISO8601DateFormatter()
+    let cutoff = Date().addingTimeInterval(-logMaxAge)
+    var keep = false
+    var kept: [Substring] = []
+    for line in lines {
+        if let date = parser.date(from: String(line.prefix(while: { $0 != " " }))) { keep = date >= cutoff }
+        if keep { kept.append(line) }
+    }
+    kept = Array(kept.suffix(logMaxLines))
+    guard kept.count != lines.count, let handle = try? FileHandle(forWritingTo: logURL) else { return }
+    defer { try? handle.close() }
+    try? handle.truncate(atOffset: 0)
+    try? handle.write(contentsOf: Data(kept.map { $0 + "\n" }.joined().utf8))
 }
 
 // MARK: - watch mode
 
+let refreshSeconds = 5.0 * 60
+
 var lastReported: State?
+var lastSnapshot: Snapshot?
 var pending: DispatchWorkItem?
 var listenedCameras = Set<CMIOObjectID>()
 var listenedProcesses = Set<AudioObjectID>()
+var listenedMics = Set<AudioObjectID>()
 
 func scheduleCheck() {
     pending?.cancel()
@@ -184,6 +245,7 @@ func scheduleCheck() {
         let snapshot = Snapshot.now()
         guard snapshot.state != lastReported else { return }
         lastReported = snapshot.state
+        lastSnapshot = snapshot
         report(snapshot)
         runHook(snapshot)
     }
@@ -209,8 +271,25 @@ func listenToAudioProcesses() {
     }
 }
 
+// Per-process IsRunningInput changes don't reliably notify (on macOS 15 a Voice
+// Memos recording fired no process listener at all), so also wake on any mic
+// device starting or stopping and re-read the per-process state then.
+func listenToMics() {
+    for device in micDevices() where !listenedMics.contains(device) {
+        var addr = audioAddress(kAudioDevicePropertyDeviceIsRunningSomewhere)
+        let status = AudioObjectAddPropertyListenerBlock(device, &addr, DispatchQueue.main) { _, _ in scheduleCheck() }
+        if status == noErr { listenedMics.insert(device) }
+    }
+}
+
 func watch() -> Never {
     setvbuf(stdout, nil, _IOLBF, 0)  // line-buffer so logs appear promptly under launchd
+
+    pruneLog()
+    let pruneTimer = DispatchSource.makeTimerSource(queue: .main)
+    pruneTimer.schedule(deadline: .now() + 3600, repeating: 3600)
+    pruneTimer.setEventHandler(handler: pruneLog)
+    pruneTimer.resume()
 
     listenToCameras()
     var camerasAddr = cameraAddress(kCMIOHardwarePropertyDevices)
@@ -226,10 +305,25 @@ func watch() -> Never {
         scheduleCheck()
     }
 
+    listenToMics()
+    var micsAddr = audioAddress(kAudioHardwarePropertyDevices)
+    AudioObjectAddPropertyListenerBlock(audioSystem, &micsAddr, DispatchQueue.main) { _, _ in
+        listenToMics()
+        scheduleCheck()
+    }
+
     let snapshot = Snapshot.now()
     lastReported = snapshot.state
+    lastSnapshot = snapshot
     report(snapshot)
     runHook(snapshot)  // sync lights/notifications with the current state on startup
+
+    let refreshTimer = DispatchSource.makeTimerSource(queue: .main)
+    refreshTimer.schedule(deadline: .now() + refreshSeconds, repeating: refreshSeconds)
+    refreshTimer.setEventHandler {
+        if let snapshot = lastSnapshot { runHook(snapshot, refresh: true) }
+    }
+    refreshTimer.resume()
 
     dispatchMain()
 }

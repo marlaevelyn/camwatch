@@ -13,6 +13,19 @@ domain="gui/$(id -u)"
 
 cd "$dir"
 
+# macOS privacy protections stop a login service from running or logging in these
+# folders, so camwatch would silently never work there.
+case "$dir/" in
+  "$HOME"/Desktop/* | "$HOME"/Documents/* | "$HOME"/Downloads/* | \
+  "$HOME"/Library/Mobile\ Documents/* | "$HOME"/Library/CloudStorage/* | /Volumes/*)
+    echo "camwatch can't run from $dir" >&2
+    echo "macOS blocks background services in Desktop, Documents, Downloads, iCloud Drive," >&2
+    echo "cloud-synced folders and external drives. Move it, e.g.:" >&2
+    echo "  mv \"$dir\" ~/camwatch && ~/camwatch/install.sh" >&2
+    exit 1
+    ;;
+esac
+
 # Mic detection needs macOS 14.2+.
 version="$(sw_vers -productVersion)"
 if [ "$(printf '%s\n' 14.2 "$version" | sort -V | head -1)" != 14.2 ]; then
