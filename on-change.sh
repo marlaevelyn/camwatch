@@ -3,9 +3,10 @@
 #   $1 = video (camera on) | mic (mic on, camera off) | off
 #   $2 = details, e.g. "camera: FaceTime HD Camera; mic: us.zoom.xos" (empty when off)
 
-# WiZ bulb to show the state: video = green, mic only = purple, off = red.
-WIZ_BULB="YOUR_BULB_IP"   # MAC YOUR_BULB_MAC
+# Sets the WiZ bulb(s) in bulb.conf to show the state: video = green,
+# mic only = purple, off = red. Change bulbs with ./set-bulb.
 
+conf="$(dirname "$0")/bulb.conf"
 state="$1"
 details="$2"
 
@@ -19,7 +20,15 @@ esac
 
 # WiZ bulbs take JSON over UDP port 38899 on the local network. UDP can drop
 # packets, so send twice.
+if [ ! -f "$conf" ]; then
+  echo "[on-change] no bulb configured; run ./set-bulb"
+  exit 0
+fi
+
 pilot="{\"method\":\"setPilot\",\"params\":{\"state\":true,$color,\"dimming\":100}}"
-for _ in 1 2; do
-  echo "$pilot" | nc -u -w1 "$WIZ_BULB" 38899 >/dev/null
-done
+while read -r bulb _; do
+  [ -n "$bulb" ] || continue
+  for _ in 1 2; do
+    echo "$pilot" | nc -u -w1 "$bulb" 38899 >/dev/null
+  done
+done < "$conf"

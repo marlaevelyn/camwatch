@@ -25,7 +25,16 @@ swiftc -O camwatch.swift -o camwatch -framework CoreMediaIO -framework CoreAudio
 ./camwatch watch    # print state now and on every change
 ```
 
-On each change, `watch` runs `on-change.sh <video|mic|off> "<details>"` from the same directory as the binary. Set `WIZ_BULB` in that script to your bulb's IP.
+On each change, `watch` runs `on-change.sh <video|mic|off> "<details>"` from the same directory as the binary. That script sets the bulbs listed in `bulb.conf`.
+
+## Choose the bulb
+
+```sh
+./set-bulb                      # list WiZ bulbs on the network (* = controlled now)
+./set-bulb d8:a0:11:7d:59:76    # control this bulb (IP or MAC; several allowed)
+```
+
+This takes effect immediately, with no restart needed. Run it again if the bulb's IP changes.
 
 ## Start at login
 

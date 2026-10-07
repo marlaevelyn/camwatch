@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Choose which WiZ bulb(s) camwatch controls.
+
+  ./set-bulb                list WiZ bulbs on the network (* = controlled now)
+  ./set-bulb <ip|mac> ...   control these bulbs from now on
+
+The choice is saved to bulb.conf (one "ip mac" per line), which on-change.sh
+reads on every change, so it takes effect without restarting camwatch.
+"""
+import json
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONF = HERE / "bulb.conf"
+PORT = 38899
+
+
+def discover(seconds=3.0):
+    """Broadcast getPilot and collect replies: {ip: pilot result}."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(0.5)
+    found = {}
+    end = time.time() + seconds
+    while time.time() < end:
+        sock.sendto(b'{"method":"getPilot","params":{}}', ("255.255.255.255", PORT))
+        try:
+            while True:
+                data, (ip, _) = sock.recvfrom(4096)
+                try:
+                    found[ip] = json.loads(data).get("result", {})
+                except ValueError:
+                    pass
+        except socket.timeout:
+            pass
+    return found
+
+
+def normalize_mac(text):
+    return text.lower().replace(":", "").replace("-", "")
+
+
+def configured():
+    """[(ip, mac)] from bulb.conf."""
+    if not CONF.exists():
+        return []
+    return [tuple((line.split() + [""])[:2]) for line in CONF.read_text().splitlines() if line.strip()]
+
+
+def describe(pilot):
+    if not pilot.get("state"):
+        return "off"
+    if "r" in pilot:
+        return f"on  rgb({pilot['r']},{pilot['g']},{pilot['b']})"
+    return "on"
+
+
+def list_bulbs():
+    current_ips = {ip for ip, _ in configured()}
+    print("Looking for WiZ bulbs...")
+    found = discover()
+    if not found:
+        sys.exit("No WiZ bulbs answered. Is this Mac on the same network as the bulbs?")
+    for ip in sorted(found, key=lambda ip: tuple(int(part) for part in ip.split("."))):
+        mark = "*" if ip in current_ips else " "
+        print(f"{mark} {ip:<15} {found[ip].get('mac', '?'):<13} {describe(found[ip])}")
+    missing = current_ips - set(found)
+    for ip in sorted(missing):
+        print(f"* {ip:<15} (configured, but did not answer)")
+    if not current_ips:
+        print("\nNo bulb configured yet. Run: ./set-bulb <ip or mac>")
+
+
+def set_bulbs(targets):
+    found = discover()
+    by_mac = {normalize_mac(pilot.get("mac", "")): ip for ip, pilot in found.items()}
+    chosen = []
+    for target in targets:
+        ip = target if target in found else by_mac.get(normalize_mac(target))
+        if not ip:
+            sys.exit(f"No WiZ bulb answered at {target}. Run ./set-bulb with no arguments to list bulbs.")
+        chosen.append((ip, found[ip].get("mac", "")))
+
+    CONF.write_text("".join(f"{ip} {mac}\n" for ip, mac in chosen))
+    for ip, mac in chosen:
+        print(f"camwatch now controls {ip} ({mac})", flush=True)
+
+    # Show the current state on the new bulb(s) right away.
+    code = subprocess.run([HERE / "camwatch", "status"], capture_output=True).returncode
+    state = {0: "video", 2: "mic"}.get(code, "off")
+    subprocess.run([HERE / "on-change.sh", state], check=False)
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+    elif args:
+        set_bulbs(args)
+    else:
+        list_bulbs()
