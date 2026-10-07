@@ -6,7 +6,7 @@
     <string>com.camwatch</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/marlaodell/camwatch/camwatch</string>
+        <string>CAMWATCH_DIR/camwatch</string>
         <string>watch</string>
     </array>
     <!-- Start at login, and restart if it ever exits. -->
@@ -15,8 +15,8 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/marlaodell/camwatch/camwatch.log</string>
+    <string>CAMWATCH_DIR/camwatch.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/marlaodell/camwatch/camwatch.log</string>
+    <string>CAMWATCH_DIR/camwatch.log</string>
 </dict>
 </plist>

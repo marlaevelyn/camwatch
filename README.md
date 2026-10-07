@@ -12,7 +12,19 @@ The camera is detected with CoreMediaIO (`kCMIODevicePropertyDeviceIsRunningSome
 
 Many call apps keep the mic open while muted, so a muted call with video off still shows purple.
 
-## Build
+## Install
+
+Requires macOS 14.2+, Xcode command-line tools (`xcode-select --install`), and the Mac on the same network as the bulbs.
+
+```sh
+gh repo clone marlaevelyn/camwatch ~/camwatch
+cd ~/camwatch
+./install.sh YOUR_BULB_MAC    # optional bulb IP or MAC; see ./set-bulb
+```
+
+`install.sh` builds camwatch, saves the bulb if one is given, and installs a LaunchAgent that starts camwatch at login and restarts it if it exits. Re-run it after pulling changes. If macOS asks whether Terminal or camwatch may find devices on your local network, allow it or the bulb won't respond.
+
+To build by hand:
 
 ```sh
 swiftc -O camwatch.swift -o camwatch -framework CoreMediaIO -framework CoreAudio
@@ -38,12 +50,10 @@ This takes effect immediately, with no restart needed. Run it again if the bulb'
 
 ## Start at login
 
-`com.camwatch.plist` is a LaunchAgent that starts `camwatch watch` at login and restarts it if it exits. It logs to `camwatch.log`. Edit the paths in it if the project lives somewhere other than `~/camwatch`.
+`install.sh` fills `CAMWATCH_DIR` in `com.camwatch.plist` with the project directory and installs it to `~/Library/LaunchAgents/`. camwatch logs to `camwatch.log`.
 
 ```sh
-cp com.camwatch.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.camwatch.plist
-
-launchctl kickstart -k gui/$(id -u)/com.camwatch   # restart after rebuilding
-launchctl bootout gui/$(id -u)/com.camwatch        # stop
+launchctl kickstart -k gui/$(id -u)/com.camwatch   # restart
+launchctl bootout gui/$(id -u)/com.camwatch        # stop until next login
+rm ~/Library/LaunchAgents/com.camwatch.plist       # ...and don't start at login
 ```
