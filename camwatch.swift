@@ -8,6 +8,7 @@
 // Event-driven; never opens the camera or mic.
 //
 // States: video (camera on, mic either way), mic (mic on, camera off), off.
+// Either trigger can be disabled with ./set-trigger; a disabled one counts as off.
 //
 // Usage:
 //   camwatch status   print state once; exit 0 = video, 2 = mic only, 1 = off
@@ -156,7 +157,11 @@ struct Snapshot {
     let cameras: [String]
     let micApps: [String]
 
-    static func now() -> Snapshot { Snapshot(cameras: activeCameras(), micApps: activeMicApps()) }
+    /// A disabled trigger (see ./set-trigger) is not read, so it never counts as on.
+    static func now() -> Snapshot {
+        Snapshot(cameras: triggerEnabled("video") ? activeCameras() : [],
+                 micApps: triggerEnabled("mic") ? activeMicApps() : [])
+    }
 
     var state: State { !cameras.isEmpty ? .video : !micApps.isEmpty ? .mic : .off }
 
@@ -179,6 +184,12 @@ func report(_ snapshot: Snapshot) {
 
 let projectDir = Bundle.main.executableURL?.resolvingSymlinksInPath().deletingLastPathComponent()
     ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+
+/// A trigger ("video" or "mic") is ignored while <project dir>/<trigger>.disabled
+/// exists. Checked on every state read, so ./set-trigger needs no rebuild.
+func triggerEnabled(_ trigger: String) -> Bool {
+    !FileManager.default.fileExists(atPath: projectDir.appendingPathComponent("\(trigger).disabled").path)
+}
 
 var hookProcess: Process?
 

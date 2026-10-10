@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """Choose which WiZ bulb(s) camwatch controls, and set their color.
 
-  ./set-bulb                    list WiZ bulbs on the network (* = controlled now)
+  ./set-bulb                    list WiZ bulbs on the network
+                                (* = controlled now, R = reference)
   ./set-bulb <ip|mac> ...       control these bulbs from now on
+  ./set-bulb follow <mac>       copy this bulb's setting when the camera and mic
+                                are off, e.g. another bulb in the same room
   ./set-bulb color R G B        set the controlled bulbs to this color (used by on-change.sh)
+  ./set-bulb match              set the controlled bulbs to the reference bulb's
+                                setting, or off if it can't be read (used by on-change.sh)
   ./set-bulb color R G B --refresh
-                                camwatch's 5-minute re-check: fix only bulbs that
+  ./set-bulb match --refresh    camwatch's 5-minute re-check: fix only bulbs that
                                 missed an update, leaving hand-set bulbs alone
 
-The choice is saved to bulb.conf (one "ip mac" per line), which is read on
-every change, so it takes effect without restarting camwatch.
+The choices are saved to bulb.conf and reference.conf (one "ip mac" per line),
+which are read on every change, so they take effect without restarting camwatch.
 
-`color` waits for each bulb to confirm and retries for about a minute. If a
-bulb stops answering, it searches the network for the bulb's MAC and updates
-bulb.conf when the bulb has a new IP.
+`color` and `match` wait for each bulb to confirm and retry for about a minute.
+If a bulb stops answering, they search the network for the bulb's MAC and
+update the .conf file when the bulb has a new IP.
 """
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -24,7 +30,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONF = HERE / "bulb.conf"
+REFERENCE = HERE / "reference.conf"
 PORT = 38899
+GET_PILOT = b'{"method":"getPilot","params":{}}'
+
+
+def is_pilot(reply):
+    return reply.get("method") == "getPilot" and "result" in reply
 
 
 def discover(seconds=3.0):
@@ -35,7 +47,7 @@ def discover(seconds=3.0):
     found = {}
     end = time.time() + seconds
     while time.time() < end:
-        sock.sendto(b'{"method":"getPilot","params":{}}', ("255.255.255.255", PORT))
+        sock.sendto(GET_PILOT, ("255.255.255.255", PORT))
         try:
             while True:
                 data, (ip, _) = sock.recvfrom(4096)
@@ -52,34 +64,35 @@ def normalize_mac(text):
     return text.lower().replace(":", "").replace("-", "")
 
 
-def configured():
-    """[(ip, mac)] from bulb.conf."""
-    if not CONF.exists():
+def configured(conf=CONF):
+    """[(ip, mac)] from bulb.conf (or reference.conf)."""
+    if not conf.exists():
         return []
-    return [tuple((line.split() + [""])[:2]) for line in CONF.read_text().splitlines() if line.strip()]
+    return [tuple((line.split() + [""])[:2]) for line in conf.read_text().splitlines() if line.strip()]
 
 
-def save(bulbs):
-    CONF.write_text("".join(f"{ip} {mac}\n" for ip, mac in bulbs))
+def save(bulbs, conf=CONF):
+    conf.write_text("".join(f"{ip} {mac}\n" for ip, mac in bulbs))
 
 
-def relocate(lost):
+def relocate(lost, conf=CONF):
     """Find bulbs that stopped answering by MAC. Returns {old_ip: new_ip}."""
     if not any(lost.values()):
         return {}
     by_mac = {normalize_mac(pilot.get("mac", "")): ip for ip, pilot in discover().items()}
     moved = {ip: by_mac[mac] for ip, mac in lost.items() if mac and by_mac.get(mac, ip) != ip}
     if moved:
-        save([(moved.get(ip, ip), mac) for ip, mac in configured()])
+        save([(moved.get(ip, ip), mac) for ip, mac in configured(conf)], conf)
         for old, new in moved.items():
-            print(f"[set-bulb] bulb {lost[old]} moved from {old} to {new}; updated bulb.conf", flush=True)
+            print(f"[set-bulb] bulb {lost[old]} moved from {old} to {new}; updated {conf.name}", flush=True)
     return moved
 
 
-def exchange(message, bulbs, accept, delays, relocate_after=None):
+def exchange(message, bulbs, accept, delays, relocate_after=None, conf=CONF):
     """Send `message` to each bulb ({ip: mac}) until it sends a reply that
     `accept`s, waiting `delays[i]` seconds before attempt i. After attempt
-    `relocate_after`, look for silent bulbs by MAC in case their IP changed.
+    `relocate_after`, look for silent bulbs by MAC in case their IP changed
+    (and save new IPs to `conf`).
     Returns ({ip: reply}, {ip: mac} of bulbs that never answered)."""
     pending = dict(bulbs)
     replies = {}
@@ -105,7 +118,7 @@ def exchange(message, bulbs, accept, delays, relocate_after=None):
         if not pending:
             break
         if attempt == relocate_after:
-            for old, new in relocate(pending).items():
+            for old, new in relocate(pending, conf).items():
                 pending[new] = pending.pop(old)
     return replies, pending
 
@@ -121,8 +134,35 @@ def set_by_camwatch(pilot):
             and not pilot.get("sceneId") and "r" in pilot)
 
 
-def apply_color(r, g, b, refresh=False):
-    """Set every configured bulb to this color, retrying until each one confirms.
+def pilot_params(pilot):
+    """The setPilot params that reproduce a bulb's getPilot result: on/off,
+    scene, color or white temperature, and brightness."""
+    if not pilot.get("state"):
+        return {"state": False}
+    params = {"state": True}
+    scene = pilot.get("sceneId", 0)
+    # Rhythm (1000) follows the WiZ app's schedule; copy the white or color it
+    # is showing rather than the scene.
+    if scene and scene != 1000:
+        params["sceneId"] = scene
+        if "speed" in pilot:
+            params["speed"] = pilot["speed"]
+    elif "r" in pilot:
+        params.update({key: pilot[key] for key in ("r", "g", "b", "c", "w") if key in pilot})
+    elif "temp" in pilot:
+        params["temp"] = pilot["temp"]
+    if "dimming" in pilot:
+        params["dimming"] = pilot["dimming"]
+    return params
+
+
+def shows(pilot, params):
+    """Whether a bulb's getPilot result already shows these setPilot params."""
+    return all(pilot.get(key) == value for key, value in params.items())
+
+
+def apply(params, refresh=False):
+    """Send setPilot `params` to every configured bulb, retrying until each one confirms.
 
     With refresh (camwatch's 5-minute re-check), only correct bulbs that still
     show a camwatch color that is now wrong, i.e. ones that missed an update.
@@ -134,17 +174,14 @@ def apply_color(r, g, b, refresh=False):
         return
 
     if refresh:
-        replies, _ = exchange(b'{"method":"getPilot","params":{}}', bulbs,
-                              lambda reply: reply.get("method") == "getPilot" and "result" in reply,
-                              delays=[0, 0], relocate_after=0)
+        replies, _ = exchange(GET_PILOT, bulbs, is_pilot, delays=[0, 0], relocate_after=0)
         bulbs = {ip: mac for ip, mac in configured()
                  if ip in replies and set_by_camwatch(current := replies[ip]["result"])
-                 and (current.get("r"), current.get("g"), current.get("b")) != (r, g, b)}
+                 and not shows(current, params)}
         if not bulbs:
             return
 
-    pilot = json.dumps({"method": "setPilot", "params": {
-        "state": True, "r": r, "g": g, "b": b, "dimming": SIGNATURE_DIMMING}}).encode()
+    pilot = json.dumps({"method": "setPilot", "params": params}).encode()
     confirmed = lambda reply: reply.get("method") == "setPilot" and reply.get("result", {}).get("success") is True
     if refresh:
         exchange(pilot, bulbs, confirmed, delays=[0, 0])
@@ -157,6 +194,40 @@ def apply_color(r, g, b, refresh=False):
               "camwatch will retry at its next 5-minute check", flush=True)
 
 
+def apply_color(r, g, b, refresh=False):
+    apply({"state": True, "r": r, "g": g, "b": b, "dimming": SIGNATURE_DIMMING}, refresh)
+
+
+def read_reference(refresh=False):
+    """The reference bulb's getPilot result, or None if none is set or it doesn't answer."""
+    reference = configured(REFERENCE)
+    if not reference:
+        return None
+    ip, mac = reference[0]
+    # A few seconds of retries for a real change; the re-check tries again in 5 minutes.
+    replies, _ = exchange(GET_PILOT, {ip: mac}, is_pilot, delays=[0, 0] if refresh else [0, 1, 2, 4],
+                          relocate_after=0 if refresh else 1, conf=REFERENCE)
+    return next(iter(replies.values()))["result"] if replies else None
+
+
+def apply_match(refresh=False):
+    """Copy the reference bulb's setting to the controlled bulbs, or switch them
+    off if it can't be read. The re-check leaves bulbs alone when it can't read
+    the reference, since the real change already switched them off."""
+    pilot = read_reference(refresh)
+    if pilot is None:
+        if refresh:
+            return
+        if configured(REFERENCE):
+            print("[set-bulb] reference bulb not responding; turning the bulb off", flush=True)
+        else:
+            print("[set-bulb] no reference bulb set; turning the bulb off. "
+                  "Choose one with ./set-bulb follow <mac>", flush=True)
+        apply({"state": False})
+        return
+    apply(pilot_params(pilot), refresh)
+
+
 def describe(pilot):
     if not pilot.get("state"):
         return "off"
@@ -167,50 +238,88 @@ def describe(pilot):
 
 def list_bulbs():
     current_ips = {ip for ip, _ in configured()}
+    reference_ips = {ip for ip, _ in configured(REFERENCE)}
     print("Looking for WiZ bulbs...")
     found = discover()
     if not found:
         sys.exit("No WiZ bulbs answered. Is this Mac on the same Wi-Fi as the bulbs? "
                  "A VPN can also block access to devices on your home network.")
     for ip in sorted(found, key=lambda ip: tuple(int(part) for part in ip.split("."))):
-        mark = "*" if ip in current_ips else " "
+        mark = "*" if ip in current_ips else "R" if ip in reference_ips else " "
         print(f"{mark} {ip:<15} {found[ip].get('mac', '?'):<13} {describe(found[ip])}")
-    missing = current_ips - set(found)
-    for ip in sorted(missing):
+    for ip in sorted(current_ips - set(found)):
         print(f"* {ip:<15} (configured, but did not answer)")
+    for ip in sorted(reference_ips - set(found)):
+        print(f"R {ip:<15} (reference, but did not answer)")
     if not current_ips:
         print("\nNo bulb configured yet. Run: ./set-bulb <ip or mac>")
+    if not reference_ips:
+        print("\nNo reference bulb set, so the bulb turns off when the camera and mic are off.\n"
+              "To copy another bulb instead, run: ./set-bulb follow <mac>")
 
 
-def set_bulbs(targets):
-    found = discover()
-    by_mac = {normalize_mac(pilot.get("mac", "")): ip for ip, pilot in found.items()}
-    chosen = []
-    for target in targets:
-        ip = target if target in found else by_mac.get(normalize_mac(target))
-        if not ip:
-            sys.exit(f"No WiZ bulb answered at {target}. Run ./set-bulb with no arguments to list bulbs.")
-        chosen.append((ip, found[ip].get("mac", "")))
-
-    save(chosen)
-    for ip, mac in chosen:
-        print(f"camwatch now controls {ip} ({mac})", flush=True)
-
-    # Show the current state on the new bulb(s) right away.
+def show_current_state():
+    """Set the controlled bulb(s) to show camwatch's current state right away."""
     code = subprocess.run([HERE / "camwatch", "status"], capture_output=True).returncode
     state = {0: "video", 2: "mic"}.get(code, "off")
     subprocess.run([HERE / "on-change.sh", state], check=False)
 
 
+def set_bulbs(targets):
+    found = discover()
+    by_mac = {normalize_mac(pilot.get("mac", "")): ip for ip, pilot in found.items()}
+    reference_macs = {mac for _, mac in configured(REFERENCE)}
+    chosen = []
+    for target in targets:
+        ip = target if target in found else by_mac.get(normalize_mac(target))
+        if not ip:
+            sys.exit(f"No WiZ bulb answered at {target}. Run ./set-bulb with no arguments to list bulbs.")
+        if normalize_mac(found[ip].get("mac", "")) in reference_macs:
+            sys.exit(f"{target} is the reference bulb. Choose another reference first: ./set-bulb follow <mac>")
+        chosen.append((ip, found[ip].get("mac", "")))
+
+    save(chosen)
+    for ip, mac in chosen:
+        print(f"camwatch now controls {ip} ({mac})", flush=True)
+    show_current_state()
+
+
+def follow(target):
+    mac = normalize_mac(target)
+    if not re.fullmatch(r"[0-9a-f]{12}", mac):
+        sys.exit("usage: ./set-bulb follow <mac>   (the reference bulb's MAC; ./set-bulb lists them)")
+    if mac in {normalize_mac(m) for _, m in configured()}:
+        sys.exit(f"{target} is a bulb camwatch controls, so it can't also be the reference.")
+    found = discover()
+    ip = next((ip for ip, pilot in found.items() if normalize_mac(pilot.get("mac", "")) == mac), None)
+    if not ip:
+        sys.exit(f"No WiZ bulb answered with MAC {target}. Run ./set-bulb with no arguments to list bulbs.")
+    if "dimming" not in found[ip]:  # plugs report no brightness
+        sys.exit(f"{target} is not a bulb. Choose a bulb to follow.")
+
+    save([(ip, mac)], REFERENCE)
+    print(f"When the camera and mic are off, camwatch now copies {ip} ({mac})", flush=True)
+    show_current_state()
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
+    refresh = "--refresh" in args
     if args and args[0] in ("-h", "--help"):
         print(__doc__.strip())
     elif args and args[0] == "color":
         rgb = [arg for arg in args[1:] if arg != "--refresh"]
         if len(rgb) != 3 or not all(value.isdigit() and int(value) <= 255 for value in rgb):
             sys.exit("usage: ./set-bulb color R G B [--refresh]   (each 0-255)")
-        apply_color(*map(int, rgb), refresh="--refresh" in args)
+        apply_color(*map(int, rgb), refresh=refresh)
+    elif args and args[0] == "match":
+        if [arg for arg in args[1:] if arg != "--refresh"]:
+            sys.exit("usage: ./set-bulb match [--refresh]")
+        apply_match(refresh)
+    elif args and args[0] == "follow":
+        if len(args) != 2:
+            sys.exit("usage: ./set-bulb follow <mac>")
+        follow(args[1])
     elif args:
         set_bulbs(args)
     else:

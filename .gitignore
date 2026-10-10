@@ -2,3 +2,6 @@ camwatch
 camwatch.new
 camwatch.log
 bulb.conf
+video.disabled
+mic.disabled
+reference.conf

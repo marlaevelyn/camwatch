@@ -6,7 +6,9 @@ Watches whether the Mac's camera and microphone are in use and sets a WiZ bulb t
 |---|---|---|---|
 | On | either | `video` | Green |
 | Off | recording | `mic` | Purple |
-| Off | not recording | `off` | Red |
+| Off | not recording | `off` | Same as the reference bulb (off if it can't be read) |
+
+The reference bulb is another bulb whose setting camwatch copies when the camera and mic are off, so the bulb goes back to matching the rest of your lights after a call. See [Choose the bulb](#choose-the-bulb).
 
 The camera is detected with CoreMediaIO (`kCMIODevicePropertyDeviceIsRunningSomewhere`), the same signal as the green light. The mic is detected per app with CoreAudio (`kAudioProcessPropertyIsRunningInput`, macOS 14.2+), so headphones playing music don't count. It is event-driven and never opens the camera or mic. A state change only takes effect after it has lasted 2 seconds.
 
@@ -57,20 +59,35 @@ swiftc -O camwatch.swift -o camwatch -framework CoreMediaIO -framework CoreAudio
 ./camwatch watch    # print state now and on every change
 ```
 
-On each change, `watch` runs `on-change.sh <video|mic|off> "<details>"` from the same directory as the binary. That script picks the color (edit it to change colors) and runs `./set-bulb color R G B`, which sets the bulbs listed in `bulb.conf`.
+On each change, `watch` runs `on-change.sh <video|mic|off> "<details>"` from the same directory as the binary. That script picks the color (edit it to change colors) and runs `./set-bulb color R G B`, which sets the bulbs listed in `bulb.conf`. For `off` it runs `./set-bulb match`, which copies the reference bulb's setting (on/off, scene, color or white, brightness) or switches the bulbs off if the reference doesn't answer within a few seconds or none is set.
 
 **Missed updates are retried.** Each bulb must confirm the change; unconfirmed bulbs are retried for about a minute, then logged as not responding. If a bulb stops answering, `set-bulb` searches the network for its MAC and updates `bulb.conf` when the bulb has a new IP. Every 5 minutes camwatch also re-checks the bulbs and corrects any that missed an update.
 
-**Changing the bulb by hand.** camwatch sets its colors at 99% brightness, an invisible difference that marks the setting as its own. The 5-minute re-check only corrects bulbs showing a camwatch color (99%, no scene) that's wrong for the current state. If you change the bulb in the WiZ app or switch it off, your setting stays until the next camera or mic change, when camwatch takes over again. The one exception is picking exactly red, green or purple at exactly 99% by hand: camwatch can't tell that from its own setting.
+**Changing the bulb by hand.** camwatch sets its colors at 99% brightness, an invisible difference that marks the setting as its own. The 5-minute re-check only corrects bulbs showing a camwatch color (99%, no scene) that's wrong for the current state: green or purple during a call, or the reference bulb's setting otherwise. If you change the bulb in the WiZ app or switch it off, your setting stays until the next camera or mic change, when camwatch takes over again. The one exception is picking a color at exactly 99% by hand: camwatch can't tell that from its own setting. When the reference bulb can't be read, the re-check changes nothing.
+
+## Choose what triggers the bulb
+
+```sh
+./set-trigger               # show which triggers are on
+./set-trigger mic off       # video only: ignore the mic
+./set-trigger video off     # mic only: ignore the camera
+./set-trigger mic           # flip mic on/off
+./set-trigger mic on        # back to both
+```
+
+A disabled trigger counts as off, so with video off a call with camera and mic shows purple, and with mic off a mic-only call copies the reference bulb. The choice is saved as `video.disabled` / `mic.disabled` in this folder. It takes effect immediately: `set-trigger` restarts camwatch so the bulb shows the new state right away.
 
 ## Choose the bulb
 
 ```sh
-./set-bulb                      # list WiZ bulbs on the network (* = controlled now)
-./set-bulb a1:b2:c3:d4:e5:f6    # control this bulb (IP or MAC; several allowed)
+./set-bulb                            # list WiZ bulbs on the network (* = controlled now, R = reference)
+./set-bulb a1:b2:c3:d4:e5:f6          # control this bulb (IP or MAC; several allowed)
+./set-bulb follow a1:b2:c3:d4:e5:f7   # reference bulb: copy it when the camera and mic are off (MAC)
 ```
 
-This takes effect immediately, with no restart needed. Run it again if the bulb's IP changes.
+These take effect immediately, with no restart needed. Run it again if the bulb's IP changes. A reference bulb that moves to a new IP is found again by its MAC.
+
+Pick a reference bulb in the same room that you normally control together with the rest of the room, not one that's often set on its own. Until a reference is set, or whenever it doesn't answer, the bulb switches off when the camera and mic are off.
 
 ## Start at login
 

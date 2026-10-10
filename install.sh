@@ -52,6 +52,11 @@ elif [ ! -f bulb.conf ]; then
   echo "  ./set-bulb <ip or mac>  # choose one"
   echo
 fi
+if [ ! -f reference.conf ]; then
+  echo "No reference bulb chosen, so the bulb turns off when the camera and mic are off."
+  echo "To copy another bulb instead: ./set-bulb follow <mac>"
+  echo
+fi
 
 echo "Installing LaunchAgent..."
 mkdir -p "$(dirname "$plist")"
